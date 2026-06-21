@@ -1,0 +1,486 @@
+import os
+import json
+import re
+import time
+import httpx
+from typing import List, Dict
+from groq import Groq
+
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS  # legacy/frozen fallback only
+
+print("[*] Loading DealScout Swarm™ engine (v15.1 - Streamlit-ready)...")
+
+# WHY THIS CHANGED: the original raised RuntimeError at *import time* if
+# GROQ_API_KEY was missing. On Streamlit Cloud that means the whole app -- including
+# any diagnostics/status page -- fails to render at all on a fresh deploy before
+# secrets are configured, with nothing but a stack trace. The engine now loads fine
+# either way; get_client() raises a clear, catchable error only when the swarm is
+# actually run without a key, so the rest of the app (status checks, the UI itself)
+# still works and can tell the user exactly what to fix.
+_client = None
+
+def get_client() -> Groq:
+    global _client
+    if _client is None:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GROQ_API_KEY is not set. On Streamlit Cloud: App settings -> Secrets, "
+                "add GROQ_API_KEY = \"...\" as a root-level key, then reboot the app."
+            )
+        _client = Groq(api_key=api_key)
+    return _client
+
+MODEL = "llama-3.3-70b-versatile"
+
+# ==============================================================================
+# 0. SEARCH BACKEND CONFIG — MULTI-PROVIDER WATERFALL
+# ==============================================================================
+# WHY A WATERFALL, NOT ONE PROVIDER:
+#  - DDG has ~0.2% share in India (Google has ~97%) -> thin coverage of Indian
+#    sources, and it's an unofficial scraper that gets rate-limited under any
+#    real load.
+#  - Serper/SerpApi-style "Google SERP" APIs proxy Google by working around its
+#    anti-bot defenses. Google sued SerpApi over exactly that in Dec 2025
+#    (DMCA anti-circumvention claims, hearing scheduled May 2026) — the whole
+#    category carries live legal risk right now, not just rate-limit risk.
+#  - Brave Search API has its own independent index (not Google, not Bing), so
+#    it isn't exposed to that specific risk -- but it dropped its perpetual
+#    free tier in Feb 2026 (now $5 signup credit, then ~$5/1k queries).
+#  - Google's own Custom Search JSON API is fully official (no scraping, no
+#    legal exposure) but capped at 100 free queries/day.
+# None of these is a silver bullet on its own. The fix is to never depend on
+# exactly one of them: try a primary, fail over to the next on error or empty
+# results, retry transient failures before giving up on a provider.
+#
+# Zero-config behavior: with no API keys set, this still runs end-to-end on
+# free ddgs alone, same as before. Each key you add upgrades it automatically.
+SEARCH_PROVIDER_PRIORITY = [
+    p.strip() for p in os.environ.get(
+        "SEARCH_PROVIDER_PRIORITY", "serper,brave,google_cse,ddgs"
+    ).split(",") if p.strip()
+]
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY")
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY")
+GOOGLE_CSE_API_KEY = os.environ.get("GOOGLE_CSE_API_KEY")
+GOOGLE_CSE_CX = os.environ.get("GOOGLE_CSE_CX")
+SEARCH_REGION = os.environ.get("SEARCH_REGION", "in")  # India bias by default
+
+SEARCH_MAX_RETRIES = int(os.environ.get("SEARCH_MAX_RETRIES", "2"))       # per provider
+SEARCH_RETRY_BASE_DELAY = float(os.environ.get("SEARCH_RETRY_BASE_DELAY", "1.5"))  # seconds, doubles each retry
+
+INDIA_BUSINESS_SOURCES = [
+    "Economic Times", "LiveMint", "Moneycontrol", "Business Standard",
+    "Financial Express", "Inc42", "YourStory", "Entrackr", "VCCircle",
+]
+
+INDIA_REGISTRY_PROVIDER = os.environ.get("INDIA_REGISTRY_PROVIDER", "none").lower()
+INDIA_REGISTRY_API_KEY = os.environ.get("INDIA_REGISTRY_API_KEY")
+
+# ==============================================================================
+# 1. SHARED WORKSPACE
+# ==============================================================================
+class SwarmState:
+    def __init__(self, query: str):
+        self.query = query
+        self.plan = []
+        self.artifacts = {}
+        self.messages = []
+        self.current_agent = None
+
+    def add_artifact(self, key: str, value: str):
+        self.artifacts[key] = value
+
+    def get_artifact(self, key: str) -> str:
+        return self.artifacts.get(key, "No data available.")
+
+    def to_dict(self):
+        return {
+            "plan": self.plan,
+            "final_answer": self.artifacts.get("final_answer", "Error: No final answer generated."),
+            "history": self.messages
+        }
+
+# ==============================================================================
+# 2. AGENT DEFINITIONS (B2B CONSULTING PERSONAS — INDIA-FOCUSED)
+# ==============================================================================
+AGENT_DEFS = {
+    "Engagement_Manager": {
+        "system_prompt": (
+            "You are the Engagement Manager at a top-tier consulting firm serving primarily "
+            "Indian founders, SMB owners, and early-stage investors. Analyze the client's request. "
+            "If they need market research, competitor analysis, or deal evaluation, delegate to "
+            "Market_Intelligence_Analyst. Otherwise, delegate to Strategy_Associate. "
+            "Assume the client and the market in question are Indian unless stated otherwise. "
+            "Be professional and concise."
+        ),
+        "tools": ["delegate_to_agent"],
+        "allowed_transitions": ["Market_Intelligence_Analyst", "Strategy_Associate"]
+    },
+    "Market_Intelligence_Analyst": {
+        "system_prompt": (
+            "You are a Senior Market Intelligence Analyst covering the Indian market. Your job is "
+            "to gather raw, actionable intelligence and hand off to the Strategy_Associate.\n"
+            "WORKFLOW:\n"
+            "1. Call `tool_web_search` to find competitor data, market sizing, or recent news. "
+            f"Prioritize and cross-check against Indian business press where relevant: {', '.join(INDIA_BUSINESS_SOURCES)}.\n"
+            "2. If the client question involves a specific Indian company, also call "
+            "`tool_lookup_indian_company` to pull registry/financial/compliance data. If it returns "
+            "'NOT CONFIGURED', say so plainly instead of guessing at numbers.\n"
+            "3. CRITICAL: Extract specific company names, financial figures, and market shares. "
+            "DO NOT output generic fluff like 'the market is growing'. Find the exact data points.\n"
+            "4. CRITICAL: every fact you carry forward MUST keep its source URL. State amounts in "
+            "₹ (INR) as the primary unit; add a USD equivalent in parentheses only when comparing "
+            "to a non-Indian competitor.\n"
+            "5. If search FAILS, save an artifact stating: 'LIVE SEARCH FAILED. Strategy_Associate "
+            "must rely on provided documents or inform client that live data is unavailable.'\n"
+            "6. Save detailed findings using `save_artifact` with key 'market_intel'.\n"
+            "7. Delegate to 'Strategy_Associate'.\n"
+            "NEVER delegate to yourself."
+        ),
+        "tools": ["tool_web_search", "tool_lookup_indian_company", "save_artifact", "delegate_to_agent"],
+        "allowed_transitions": ["Strategy_Associate"]
+    },
+    "Strategy_Associate": {
+        "system_prompt": (
+            "You are a Strategy Associate. You write high-value executive memos for Indian clients.\n"
+            "WORKFLOW:\n"
+            "1. Read 'market_intel' from workspace using `read_artifact`.\n"
+            "2. Write a comprehensive strategy draft. Tone: Objective, analytical, direct. No fluff.\n"
+            "3. REQUIRED FORMAT (No exceptions):\n\n"
+            "🎯 EXECUTIVE BOTTOM LINE:\n(2-3 sentences stating the exact strategic outcome or risk)\n\n"
+            "🧠 STRATEGIC CONTEXT:\n(3-4 sentences on market positioning, implications, or competitive landscape)\n\n"
+            "🚨 RISK FACTORS:\n- (Specific risk 1)\n- (Specific risk 2)\n\n"
+            "📊 KEY DATA POINTS:\n- (Specific metric/fact 1) (Source: <name>, <url>)\n"
+            "- (Specific metric/fact 2) (Source: <name>, <url>)\n\n"
+            "4. State financials in ₹ (INR) as the primary unit, e.g. '₹42 Cr (~$5M)' when a USD "
+            "comparison is useful. EVERY entry under KEY DATA POINTS must carry an inline "
+            "'(Source: name, url)' citation pulled from market_intel. If market_intel has no "
+            "source for a number, do not state it as fact — flag it as unverified instead.\n"
+            "5. Save draft using `save_artifact` with key 'strategy_draft'.\n"
+            "6. Delegate to 'Risk_Director'.\n"
+            "NEVER delegate to yourself."
+        ),
+        "tools": ["read_artifact", "save_artifact", "delegate_to_agent"],
+        "allowed_transitions": ["Risk_Director"]
+    },
+    "Risk_Director": {
+        "system_prompt": (
+            "You are the Risk Director. You are the bad cop. Your job is to stress-test the "
+            "Strategy_Associate's draft.\n"
+            "WORKFLOW:\n"
+            "1. Read 'strategy_draft' from workspace using `read_artifact`.\n"
+            "CHECKS:\n"
+            "- Is it too generic? (e.g., 'AI is growing'). If yes, REJECT and delegate back to "
+            "Strategy_Associate with note: 'Too generic. Require specific competitor names and "
+            "financial metrics.'\n"
+            "- Does EVERY entry under KEY DATA POINTS carry a '(Source: name, url)' citation? If "
+            "even one data point lacks a source, REJECT and delegate back to Strategy_Associate "
+            "with note: 'Unsourced claim(s) found — every data point needs a verifiable citation.'\n"
+            "- Are there missing risks? If yes, REJECT and delegate back to Strategy_Associate.\n"
+            "- Did it follow the exact format? If no, REJECT.\n"
+            "If it is sharp, accurate, fully sourced, and executive-ready, delegate to "
+            "Managing_Partner. DO NOT delegate to yourself."
+        ),
+        "tools": ["read_artifact", "save_artifact", "delegate_to_agent"],
+        "allowed_transitions": ["Strategy_Associate", "Managing_Partner"]
+    },
+    "Managing_Partner": {
+        "system_prompt": (
+            "You are the Managing Partner. Read the 'strategy_draft' using `read_artifact`. Ensure "
+            "it is perfectly formatted, polished, and that every data point still carries its source "
+            "citation. Save it as 'final_answer' using `save_artifact`. Then use the `finish_task` "
+            "tool to end the engagement. DO NOT change the core strategic insights or remove "
+            "citations, just ensure executive readability."
+        ),
+        "tools": ["read_artifact", "save_artifact", "finish_task"],
+        "allowed_transitions": []
+    }
+}
+
+# ==============================================================================
+# 3. TOOL IMPLEMENTATIONS
+# ==============================================================================
+class ProviderNotConfigured(Exception):
+    """Raised when a provider is missing required credentials. Distinct from
+    transient failures (timeouts, 429s) so the retry logic doesn't waste
+    exponential-backoff delays retrying something that can never succeed."""
+    pass
+
+
+def _with_retries(fn, *args, max_retries=SEARCH_MAX_RETRIES, base_delay=SEARCH_RETRY_BASE_DELAY, **kwargs):
+    """Retries a search backend call on transient failure (timeouts, 429s, etc.)
+    with exponential backoff. Missing-credential failures skip retries entirely
+    and fail fast, since no amount of waiting fixes a missing API key."""
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except ProviderNotConfigured as e:
+            raise  # fail fast, no point retrying a missing key
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                print(f"    [RETRY] {fn.__name__} failed ({e}); retrying in {delay:.1f}s...")
+                time.sleep(delay)
+    raise last_exc
+
+
+def _search_via_serper(query: str, max_results: int = 5) -> list:
+    if not SERPER_API_KEY:
+        raise ProviderNotConfigured("SERPER_API_KEY not set")
+    resp = httpx.post(
+        "https://google.serper.dev/search",
+        headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+        json={"q": query, "gl": SEARCH_REGION, "hl": "en", "num": max_results},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    organic = resp.json().get("organic", [])[:max_results]
+    return [{"title": r.get("title", ""), "body": r.get("snippet", ""), "href": r.get("link", "")} for r in organic]
+
+
+def _search_via_brave(query: str, max_results: int = 5) -> list:
+    if not BRAVE_API_KEY:
+        raise ProviderNotConfigured("BRAVE_API_KEY not set")
+    resp = httpx.get(
+        "https://api.search.brave.com/res/v1/web/search",
+        headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"},
+        params={"q": query, "country": SEARCH_REGION, "count": max_results},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("web", {}).get("results", [])[:max_results]
+    return [{"title": r.get("title", ""), "body": r.get("description", ""), "href": r.get("url", "")} for r in results]
+
+
+def _search_via_google_cse(query: str, max_results: int = 5) -> list:
+    if not (GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX):
+        raise ProviderNotConfigured("GOOGLE_CSE_API_KEY / GOOGLE_CSE_CX not set")
+    resp = httpx.get(
+        "https://www.googleapis.com/customsearch/v1",
+        params={"key": GOOGLE_CSE_API_KEY, "cx": GOOGLE_CSE_CX, "q": query,
+                "gl": SEARCH_REGION, "num": min(max_results, 10)},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    items = resp.json().get("items", [])[:max_results]
+    return [{"title": r.get("title", ""), "body": r.get("snippet", ""), "href": r.get("link", "")} for r in items]
+
+
+def _search_via_ddgs(query: str, max_results: int = 5) -> list:
+    region = f"{SEARCH_REGION}-en"
+    with DDGS(timeout=10) as ddgs:
+        return list(ddgs.text(query, region=region, safesearch="off", max_results=max_results))
+
+
+_SEARCH_BACKENDS = {
+    "serper": _search_via_serper,
+    "brave": _search_via_brave,
+    "google_cse": _search_via_google_cse,
+    "ddgs": _search_via_ddgs,
+}
+
+
+def tool_web_search(query: str) -> str:
+    """Tries each configured provider in SEARCH_PROVIDER_PRIORITY order, retrying
+    transient failures within a provider before moving to the next one. Providers
+    with no API key configured raise immediately (no network call wasted) and are
+    skipped. Only fails outright if every provider in the list is exhausted."""
+    clean_query = query.replace("top 3", "").replace("latest", "").strip()
+    if not clean_query:
+        clean_query = "market analysis"
+
+    errors = []
+    for provider in SEARCH_PROVIDER_PRIORITY:
+        backend = _SEARCH_BACKENDS.get(provider)
+        if backend is None:
+            errors.append(f"{provider}: unknown provider name")
+            continue
+        print(f"    [TOOL_EXEC] Trying provider='{provider}' region='{SEARCH_REGION}': {clean_query!r}")
+        try:
+            results = _with_retries(backend, clean_query)
+        except Exception as e:
+            print(f"    [WARN] provider='{provider}' exhausted retries: {e}")
+            errors.append(f"{provider}: {e}")
+            continue
+
+        if not results:
+            errors.append(f"{provider}: no results")
+            continue
+
+        lines = [f"(results via {provider}, region={SEARCH_REGION})"]
+        for i, r in enumerate(results):
+            title = r.get("title", "")
+            url = r.get("href", "") or r.get("link", "")
+            body = r.get("body", "") or r.get("snippet", "")
+            lines.append(f"[{i+1}] {title} — {url}\n    {body}")
+        return "\n".join(lines)
+
+    return "LIVE SEARCH FAILED across all configured providers: " + "; ".join(errors)
+
+
+def tool_lookup_indian_company(company_name: str) -> str:
+    """
+    Structured lookup for an Indian company via a Tofler / Probe42 / MCA21-backed
+    provider. NOT WIRED TO A LIVE API -- scaffolding only. Get a developer key from
+    Tofler (tofler.in) or Probe42 (probe42.in), set INDIA_REGISTRY_PROVIDER /
+    INDIA_REGISTRY_API_KEY, and replace the body with the real request from their docs.
+    Returns an explicit "not configured" message rather than ever fabricating data.
+    """
+    if INDIA_REGISTRY_PROVIDER == "none" or not INDIA_REGISTRY_API_KEY:
+        return (
+            "INDIA REGISTRY LOOKUP NOT CONFIGURED: set INDIA_REGISTRY_PROVIDER and "
+            "INDIA_REGISTRY_API_KEY (e.g. a Tofler or Probe42 account) to pull structured "
+            "company/financial/compliance data instead of relying on web search alone. "
+            f"Falling back to web search for '{company_name}'."
+        )
+    return f"INDIA REGISTRY LOOKUP NOT YET IMPLEMENTED for provider '{INDIA_REGISTRY_PROVIDER}'."
+
+TOOL_SCHEMAS = [
+    {"type": "function", "function": {"name": "delegate_to_agent", "description": "Hand off the current task to another agent.", "parameters": {"type": "object", "properties": {"agent_name": {"type": "string", "enum": list(AGENT_DEFS.keys())}, "message": {"type": "string"}}, "required": ["agent_name", "message"]}}},
+    {"type": "function", "function": {"name": "tool_web_search", "description": "Search the web for market data, competitor info, or news. Biased toward the Indian market by default.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "tool_lookup_indian_company", "description": "Look up structured registry/financial/compliance data for a named Indian company.", "parameters": {"type": "object", "properties": {"company_name": {"type": "string"}}, "required": ["company_name"]}}},
+    {"type": "function", "function": {"name": "save_artifact", "description": "Save work to the shared workspace.", "parameters": {"type": "object", "properties": {"key": {"type": "string", "enum": ["market_intel", "strategy_draft", "final_answer"]}, "content": {"type": "string"}}, "required": ["key", "content"]}}},
+    {"type": "function", "function": {"name": "read_artifact", "description": "Read an artifact from the workspace.", "parameters": {"type": "object", "properties": {"key": {"type": "string", "enum": ["market_intel", "strategy_draft"]}}, "required": ["key"]}}},
+    {"type": "function", "function": {"name": "finish_task", "description": "End the swarm process.", "parameters": {"type": "object", "properties": {}}}}
+]
+
+def get_tool_schemas_for_agent(agent_name: str) -> list:
+    allowed = set(AGENT_DEFS[agent_name]["tools"])
+    return [s for s in TOOL_SCHEMAS if s["function"]["name"] in allowed]
+
+
+def dispatch_tool_call(state: SwarmState, agent_name: str, agent_def: dict, func_name: str, func_args: dict):
+    """Returns (observation: str, finished: bool). Shared by both the normal tool_calls
+    path and the self-heal path."""
+    if func_name not in agent_def["tools"]:
+        return (f"ERROR: {agent_name} is not permitted to use '{func_name}'. "
+                f"Permitted tools: {agent_def['tools']}."), False
+
+    if func_name == "delegate_to_agent":
+        next_agent = func_args["agent_name"]
+        if next_agent == agent_name:
+            return (f"CRITICAL ERROR: You cannot delegate to yourself! You are {agent_name}. "
+                     f"Delegate to: {agent_def['allowed_transitions']}."), False
+        if next_agent not in agent_def["allowed_transitions"]:
+            return (f"ERROR: You cannot delegate to {next_agent}. "
+                     f"Delegate to: {agent_def['allowed_transitions']}."), False
+        state.current_agent = next_agent
+        handoff_note = func_args.get("message", "")
+        return f"Control handed over to {next_agent}. Handoff note from {agent_name}: {handoff_note}", False
+
+    elif func_name == "save_artifact":
+        state.add_artifact(func_args["key"], func_args["content"])
+        return f"Artifact '{func_args['key']}' saved successfully.", False
+
+    elif func_name == "read_artifact":
+        return state.get_artifact(func_args["key"]), False
+
+    elif func_name == "tool_web_search":
+        return tool_web_search(**func_args), False
+
+    elif func_name == "tool_lookup_indian_company":
+        return tool_lookup_indian_company(**func_args), False
+
+    elif func_name == "finish_task":
+        if "final_answer" not in state.artifacts:
+            state.add_artifact("final_answer", "Task finished, but no final answer was saved.")
+        return "Task finished.", True
+
+    return f"Error: Tool {func_name} not found.", False
+
+
+# ==============================================================================
+# 4. THE AGENTIC EXECUTION LOOP (With Self-Healing)
+# ==============================================================================
+def execute_agent_loop(state: SwarmState, max_steps: int = 15) -> dict:
+    step = 0
+    while step < max_steps:
+        step += 1
+        agent_name = state.current_agent
+        agent_def = AGENT_DEFS[agent_name]
+        print(f"\n[STEP {step}] Executing Agent: {agent_name}")
+        state.plan.append(agent_name)
+
+        api_messages = [{"role": "system", "content": agent_def["system_prompt"]}] + state.messages
+        agent_tools = get_tool_schemas_for_agent(agent_name)
+
+        try:
+            response = get_client().chat.completions.create(
+                model=MODEL, messages=api_messages, tools=agent_tools,
+                tool_choice="auto", max_tokens=2000, temperature=0.3
+            )
+        except Exception as e:
+            error_str = str(e)
+            if "failed_generation" in error_str and "<function=" in error_str:
+                print("    [SELF-HEAL] Caught malformed function call. Parsing manually...")
+                match = re.search(r'<function=(\w+)>(\{.*?\})</function>', error_str)
+                if match:
+                    func_name, raw_args = match.group(1), match.group(2)
+                    try:
+                        func_args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        state.add_artifact("final_answer", f"⚠️ Swarm API Error (unparseable self-heal args): {e}")
+                        return state.to_dict()
+                    print(f"    [SELF-HEAL] Manually executing: {func_name}({func_args})")
+                    observation, finished = dispatch_tool_call(state, agent_name, agent_def, func_name, func_args)
+                    healed_id = "healed_call_1"
+                    state.messages.append({
+                        "role": "assistant", "content": None,
+                        "tool_calls": [{"id": healed_id, "type": "function",
+                                        "function": {"name": func_name, "arguments": json.dumps(func_args)}}]
+                    })
+                    state.messages.append({"role": "tool", "name": func_name, "content": str(observation), "tool_call_id": healed_id})
+                    if finished:
+                        return state.to_dict()
+                    continue
+            state.add_artifact("final_answer", f"⚠️ Swarm API Error: {e}")
+            return state.to_dict()
+
+        choice = response.choices[0]
+        if choice.finish_reason == "tool_calls":
+            state.messages.append(choice.message)
+            for tool_call in choice.message.tool_calls:
+                try:
+                    func_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    state.messages.append({
+                        "role": "tool", "name": tool_call.function.name,
+                        "content": f"ERROR: Could not parse arguments as JSON: {tool_call.function.arguments!r}",
+                        "tool_call_id": tool_call.id
+                    })
+                    continue
+
+                func_name = tool_call.function.name
+                print(f"    [ACTION] {func_name}({func_args})")
+                observation, finished = dispatch_tool_call(state, agent_name, agent_def, func_name, func_args)
+                state.messages.append({"role": "tool", "name": func_name, "content": str(observation), "tool_call_id": tool_call.id})
+
+                if finished:
+                    return state.to_dict()
+
+        elif choice.finish_reason == "stop":
+            state.messages.append({"role": "assistant", "content": choice.message.content})
+            state.messages.append({"role": "user", "content": "You must use a tool to proceed. Delegate, save, or finish."})
+        else:
+            state.add_artifact("final_answer", f"⚠️ Swarm stopped unexpectedly (finish_reason='{choice.finish_reason}').")
+            break
+
+    if "final_answer" not in state.artifacts:
+        state.add_artifact("final_answer", "⚠️ Swarm exceeded maximum steps without finishing.")
+    return state.to_dict()
+
+# ==============================================================================
+# 5. ENTRY POINT
+# ==============================================================================
+def run_swarm(user_prompt: str) -> dict:
+    print(f"\n[SWARM v15.0 — India Edition] Query: {user_prompt[:60]}...")
+    state = SwarmState(query=user_prompt)
+    state.current_agent = "Engagement_Manager"
+    state.messages.append({"role": "user", "content": f"Client Request: {user_prompt}\n\nPlease delegate this to the appropriate consultant."})
+    return execute_agent_loop(state)
