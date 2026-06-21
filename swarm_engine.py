@@ -11,7 +11,7 @@ if not os.environ.get("GROQ_API_KEY"):
     raise RuntimeError("FATAL ERROR: GROQ_API_KEY environment variable is not set.")
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "openai/gpt-oss-20b"
 
 # ==============================================================================
 # 1. SHARED WORKSPACE
