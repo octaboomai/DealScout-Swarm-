@@ -2,247 +2,300 @@ import streamlit as st
 import sys
 import os
 import PyPDF2
+import json
+import re
+import time
 
+# Ensure swarm_engine is in path
 sys.path.append(os.path.dirname(__file__))
 from swarm_engine import run_swarm
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. AGENCY CONFIGURATION
+# 1. AGENCY CONFIGURATION (WhatsApp + UPI Method)
 # ─────────────────────────────────────────────────────────────────────────────
 AGENCY_NAME = "DealScout Intelligence™"
-
-# --- MONETIZATION SETUP (WhatsApp + UPI Method) ---
-# 1. Enter your WhatsApp number with country code (NO + or spaces). E.g., 919876543210 for India
 WHATSAPP_NUMBER = "919876543210" 
-
-# 2. The pre-filled message the user will send you
 UPGRADE_MESSAGE = "Hi! I want to upgrade to DealScout Pro Unlimited Access. Please share the payment details."
-
-# 3. Automatically generate the WhatsApp Click-to-Chat link
 WHATSAPP_LINK = f"https://wa.me/{WHATSAPP_NUMBER}?text={UPGRADE_MESSAGE.replace(' ', '%20')}"
 
-# 4. Set the Pro Code you will manually send them after they pay via GPay/PhonePe
-FREE_TRIAL_CODE = "FREETRIAL"            # Give this to prospects on LinkedIn
-PRO_UNLOCK_CODE = "DEALSCOUT_PRO_2024"   # Send this via WhatsApp after payment is confirmed
+FREE_TRIAL_CODE = "FREETRIAL"
+PRO_UNLOCK_CODE = "DEALSCOUT_PRO_2024"
 
 st.set_page_config(page_title=AGENCY_NAME, layout="centered", initial_sidebar_state="expanded")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. PREMIUM UI STYLING (Dark Mode, Executive Aesthetic)
+# 2. PREMIUM UX STYLING (Next.js / Tailwind Emulation in Streamlit)
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
-#MainMenu, header, footer, [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"] { display: none !important; }
-html, body, [data-testid="stAppViewContainer"] { background: #09090b !important; font-family: 'Inter', sans-serif !important; }
-[data-testid="stMain"] > div { max-width: 800px !important; margin: 0 auto !important; padding: 0 24px !important; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
-/* Header & Typography */
-.agency-header { text-align: center; padding: 48px 0 32px; border-bottom: 1px solid #27272a; margin-bottom: 32px; }
-.agency-logo { font-size: 40px; margin-bottom: 8px; }
-.agency-title { font-size: 22px; font-weight: 600; color: #fafafa; letter-spacing: -0.5px; margin: 0; }
-.agency-sub { font-size: 13px; color: #71717a; margin-top: 6px; text-transform: uppercase; letter-spacing: 1px; }
+/* Hide Streamlit Junk */
+#MainMenu, header, footer, [data-testid="stToolbar"] { display: none !important; }
+html, body, [data-testid="stAppViewContainer"] { background: #020617 !important; font-family: 'Inter', sans-serif !important; color: #f8fafc; }
+[data-testid="stMain"] > div { max-width: 850px !important; margin: 0 auto !important; padding: 2rem !important; }
 
-/* Chat Messages */
-[data-testid="stChatMessage"] { background: transparent !important; border: none !important; padding: 0 !important; margin-bottom: 32px !important; gap: 12px !important; }
-[data-testid="chatAvatarIcon-user"] { background: #27272a !important; color: #a1a1aa !important; width: 28px !important; height: 28px !important; border-radius: 4px !important; }
-[data-testid="chatAvatarIcon-assistant"] { background: #f59e0b !important; color: #000 !important; width: 28px !important; height: 28px !important; border-radius: 4px !important; }
-[data-testid="stMarkdownContainer"] p { font-size: 15px !important; line-height: 1.8 !important; color: #d4d4d8 !important; margin: 0 0 8px !important; }
-[data-testid="stMarkdownContainer"] strong { color: #fafafa !important; font-weight: 600 !important; }
+/* Header Formatting */
+.agency-header { display: flex; align-items: center; gap: 12px; padding: 20px 0; border-bottom: 1px solid #1e293b; margin-bottom: 30px; }
+.agency-logo { background: linear-gradient(135deg, #34d399, #06b6d4); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 28px; font-weight: 700; }
+.agency-sub { color: #94a3b8; font-size: 14px; font-weight: 500; }
 
-/* Route Pills (Agent History) */
-.route-pill { display: inline-flex; align-items: center; gap: 6px; background: #18181b; border: 1px solid #27272a; border-radius: 6px; padding: 4px 12px; font-size: 11px; color: #71717a; margin-bottom: 16px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
-.route-dot { width: 6px; height: 6px; border-radius: 50%; background: #f59e0b; display: inline-block; }
+/* Dashboard Cards */
+.ds-card { background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.2); }
+.ds-card-title { display: flex; align-items: center; gap: 8px; color: #f8fafc; font-size: 18px; font-weight: 600; border-bottom: 1px solid #1e293b; padding-bottom: 12px; margin-bottom: 16px; margin-top: 0;}
+.ds-icon { font-size: 20px; }
 
-/* Executive Report Formatting */
-.exec-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid #27272a; }
-.exec-label { font-size: 12px; font-weight: 600; color: #f59e0b; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+/* Typography inside Cards */
+.ds-text { color: #cbd5e1; font-size: 16px; line-height: 1.7; margin: 0; }
 
-/* Input & Buttons */
-[data-testid="stChatInput"] { background: #18181b !important; border: 1px solid #27272a !important; border-radius: 8px !important; }
-[data-testid="stChatInput"] textarea { background: transparent !important; color: #e4e4e7 !important; font-size: 15px !important; }
-[data-testid="stChatInput"] textarea::placeholder { color: #3f3f46 !important; }
-.stButton>button { background: #f59e0b !important; color: #000 !important; border: none !important; font-weight: 600 !important; border-radius: 6px !important; }
-.stButton>button:hover { background: #d97706 !important; }
+/* Data Rows (Key Metrics) */
+.ds-metric-row { display: flex; justify-content: space-between; align-items: center; background: #020617; border: 1px solid #1e293b; border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; }
+.ds-metric-label { color: #94a3b8; font-weight: 500; font-size: 14px; }
+.ds-metric-value { color: #f8fafc; font-weight: 700; font-size: 18px; display: flex; gap: 12px; align-items: center;}
+.ds-trend-up { color: #34d399; font-size: 14px; }
+.ds-trend-down { color: #f43f5e; font-size: 14px; }
+.ds-trend-flat { color: #94a3b8; font-size: 14px; }
 
-/* WhatsApp specific styling */
-.whatsapp-btn { display: inline-block; background: #25D366; color: white !important; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-weight: 600; margin-top: 10px; font-size: 14px; }
-.whatsapp-btn:hover { background: #1ebe57; }
+/* Risk Matrix */
+.ds-risk-row { display: flex; justify-content: space-between; align-items: flex-start; padding: 12px 0; border-bottom: 1px solid #1e293b; }
+.ds-risk-row:last-child { border-bottom: none; }
+.ds-risk-title { color: #e2e8f0; font-weight: 500; font-size: 15px; }
+.ds-badge { padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
+.ds-badge-high { background: rgba(244, 63, 94, 0.15); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.3); box-shadow: 0 0 10px rgba(244, 63, 94, 0.2); }
+.ds-badge-medium { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+.ds-badge-low { background: rgba(148, 163, 184, 0.15); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.3); }
+
+/* Inputs & Buttons */
+[data-testid="stChatInput"] { background: #0f172a !important; border: 1px solid #334155 !important; }
+[data-testid="stChatInput"] textarea { color: #f8fafc !important; }
+.stButton>button { background: #34d399 !important; color: #020617 !important; border: none !important; font-weight: 600 !important; border-radius: 8px !important; transition: 0.2s; }
+.stButton>button:hover { background: #10b981 !important; }
+.whatsapp-btn { display: block; background: #25D366; color: white !important; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: 600; text-align: center; margin: 10px 0; font-size: 15px; transition: 0.2s;}
+.whatsapp-btn:hover { background: #1ebe57; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(37, 211, 102, 0.3);}
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. AGENCY ACCESS GATE (WhatsApp + UPI Integration)
+# 3. HELPER FUNCTIONS (JSON Parser)
+# ─────────────────────────────────────────────────────────────────────────────
+def extract_json_from_text(text: str):
+    """Fallback parser in case the AI wraps JSON in markdown blocks like ```json ... ```"""
+    try:
+        # First, try to parse it directly
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # If it fails, search for a JSON object structure
+        match = re.search(r'\{[\s\S]*\}', text)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except:
+                pass
+    return None
+
+def render_dashboard(data: dict):
+    """Converts the JSON Dictionary into our beautiful Streamlit UI HTML"""
+    
+    html = f"""
+    <div style="margin-bottom: 40px;">
+        <h2 style="color: #f8fafc; font-size: 26px; font-weight: 700; margin-bottom: 24px;">
+            {data.get('title', 'Intelligence Report')}
+        </h2>
+
+        <!-- Executive Summary Card -->
+        <div class="ds-card">
+            <h3 class="ds-card-title"><span class="ds-icon">💼</span> Executive Bottom Line</h3>
+            <p class="ds-text">{data.get('executive_summary', 'No summary provided.')}</p>
+        </div>
+    """
+
+    # Create a 2-column layout using flexbox inside HTML
+    html += '<div style="display: flex; gap: 24px; flex-wrap: wrap;">'
+
+    # Market Data Card
+    html += '<div class="ds-card" style="flex: 1; min-width: 300px;"><h3 class="ds-card-title"><span class="ds-icon">📊</span> Key Data Points</h3>'
+    metrics = data.get('market_data', [])
+    for m in metrics:
+        if isinstance(m, dict):
+            label = m.get('label', 'Metric')
+            val = m.get('value', 'N/A')
+            trend = m.get('trend', '')
+            trend_class = "ds-trend-up" if "+" in trend else "ds-trend-down" if "-" in trend else "ds-trend-flat"
+            
+            html += f"""
+            <div class="ds-metric-row">
+                <span class="ds-metric-label">{label}</span>
+                <span class="ds-metric-value">{val} <span class="{trend_class}">{trend}</span></span>
+            </div>
+            """
+        else:
+            html += f'<div class="ds-metric-row"><span class="ds-metric-label">{m}</span></div>'
+    html += '</div>'
+
+    # Risk Matrix Card
+    html += '<div class="ds-card" style="flex: 1; min-width: 300px;"><h3 class="ds-card-title"><span class="ds-icon">🚨</span> Risk Matrix</h3>'
+    risks = data.get('risk_matrix', [])
+    for r in risks:
+        if isinstance(r, dict):
+            risk_text = r.get('risk', 'Unknown Risk')
+            sev = r.get('severity', 'Medium')
+            badge_class = "ds-badge-high" if sev.lower() == "high" else "ds-badge-low" if sev.lower() == "low" else "ds-badge-medium"
+            
+            html += f"""
+            <div class="ds-risk-row">
+                <span class="ds-risk-title">{risk_text}</span>
+                <span class="ds-badge {badge_class}">{sev.upper()}</span>
+            </div>
+            """
+        else:
+            html += f'<div class="ds-risk-row"><span class="ds-risk-title">{r}</span></div>'
+    html += '</div>'
+
+    html += '</div></div>' # Close flex container and wrapper
+    
+    st.markdown(html, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. AGENCY ACCESS GATE 
 # ─────────────────────────────────────────────────────────────────────────────
 if "access_tier" not in st.session_state:
-    st.session_state.access_tier = None # None = locked, "free" = basic, "pro" = unlimited
+    st.session_state.access_tier = None 
 
 if st.session_state.access_tier is None:
     st.markdown(f"""
-    <div class="agency-header">
-        <div class="agency-logo">📊</div>
-        <p class="agency-title">{AGENCY_NAME}</p>
-        <p class="agency-sub">Autonomous B2B Intelligence & Risk Mitigation</p>
+    <div style="text-align: center; margin-top: 10vh; margin-bottom: 40px;">
+        <h1 style="font-size: 3rem; margin-bottom: 0;">DealScout <span style="color: #34d399;">Pro</span></h1>
+        <p style="color: #94a3b8; font-size: 1.1rem;">Autonomous B2B Intelligence & Risk Mitigation Platform</p>
     </div>
     """, unsafe_allow_html=True)
     
-    st.markdown("### 🔒 Private Access Portal")
-    st.markdown("This platform is for authorized consultants and enterprise clients only.")
-    
     col1, col2 = st.columns(2)
-    
     with col1:
-        st.markdown("#### Free Trial Access")
-        st.markdown("Use the trial code to test the Swarm.")
+        st.markdown("<div class='ds-card'>", unsafe_allow_html=True)
+        st.markdown("### 🆓 Trial Access")
+        st.markdown("Use your invite code to run a limited test.")
         free_code = st.text_input("Enter Free Trial Code:", key="free_code")
-        if st.button("Unlock Free Trial"):
+        if st.button("Unlock Free Trial", use_container_width=True):
             if free_code == FREE_TRIAL_CODE:
                 st.session_state.access_tier = "free"
                 st.rerun()
             else:
-                st.error("Invalid Free Trial Code.")
+                st.error("Invalid Code.")
+        st.markdown("</div>", unsafe_allow_html=True)
                 
     with col2:
-        st.markdown("#### Pro Unlimited Access")
-        st.markdown("Get unlimited reports. Pay seamlessly via GPay/PhonePe.")
-        
-        # The Magic WhatsApp Button
-        st.markdown(f'<a href="{WHATSAPP_LINK}" target="_blank" class="whatsapp-btn">💬 Message Us on WhatsApp</a>', unsafe_allow_html=True)
-        
-        st.markdown("<small>1. Click above 👆<br>2. Send the pre-filled message<br>3. Pay via UPI link we send<br>4. Get your Pro Code instantly!</small>", unsafe_allow_html=True)
-        
+        st.markdown("<div class='ds-card'>", unsafe_allow_html=True)
+        st.markdown("### 💎 Pro Access")
+        st.markdown("Unlimited reports. Instant UPI Setup.")
+        st.markdown(f'<a href="{WHATSAPP_LINK}" target="_blank" class="whatsapp-btn">💬 Get Pro Code via WhatsApp</a>', unsafe_allow_html=True)
         pro_code = st.text_input("Enter Pro Code (sent via WhatsApp):", key="pro_code")
-        if st.button("Unlock Pro"):
+        if st.button("Unlock Pro", use_container_width=True):
             if pro_code == PRO_UNLOCK_CODE:
                 st.session_state.access_tier = "pro"
                 st.rerun()
             else:
-                st.error("Invalid Pro Code. Please complete payment on WhatsApp.")
-    
-    st.stop() # Halts the app here until they enter a correct code
-
+                st.error("Invalid Pro Code.")
+        st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. SECURE DEAL ROOM (PDF Vault)
+# 5. SECURE DEAL ROOM (Sidebar)
 # ─────────────────────────────────────────────────────────────────────────────
 if "document_context" not in st.session_state:
     st.session_state.document_context = ""
+if "history" not in st.session_state:
+    st.session_state.history = []
 
 with st.sidebar:
-    st.markdown(f"**👤 Tier: {st.session_state.access_tier.upper()}**")
-    
+    st.markdown(f"### 👤 Tier: {st.session_state.access_tier.upper()}")
     if st.session_state.access_tier == 'free':
-        st.warning("🆓 Free Trial Active")
-        st.markdown("---")
-        st.markdown("**Upgrade to Pro for Unlimited Reports**")
-        
-        # Sidebar WhatsApp Button
-        st.markdown(f'<a href="{WHATSAPP_LINK}" target="_blank" class="whatsapp-btn" style="width: 100%; text-align: center; display: block;">💬 Upgrade via WhatsApp</a>', unsafe_allow_html=True)
-        
-        # Allow Pro upgrade even after inside the app
-        pro_code_sidebar = st.text_input("Enter Pro Code to upgrade:")
-        if st.button("Unlock Pro"):
-            if pro_code_sidebar == PRO_UNLOCK_CODE:
-                st.session_state.access_tier = 'pro'
-                st.rerun()
-            elif pro_code_sidebar:
-                st.error("Invalid Pro Code.")
-    else:
-        st.success("♾️ Unlimited Pro Access")
-
+        st.markdown(f'<a href="{WHATSAPP_LINK}" target="_blank" class="whatsapp-btn">⚡ Upgrade to Pro</a>', unsafe_allow_html=True)
+    
     st.divider()
-    st.markdown("<h3 style='color: #fafafa; font-weight: 600;'>📂 Secure Deal Room</h3>", unsafe_allow_html=True)
-    st.markdown("<p style='color: #71717a; font-size: 13px;'>Upload Pitch Decks, 10-Ks, or Market Reports.</p>", unsafe_allow_html=True)
+    st.markdown("### 📂 Deal Room Vault")
+    st.markdown("<p style='color: #94a3b8; font-size: 13px;'>Upload PDF for RAG Analysis.</p>", unsafe_allow_html=True)
     
     uploaded_file = st.file_uploader("", type="pdf")
     if uploaded_file is not None:
         try:
             pdf_reader = PyPDF2.PdfReader(uploaded_file)
             text = "".join([page.extract_text() + "\n" for page in pdf_reader.pages if page.extract_text()])
-            if len(text) > 12000: text = text[:12000] + "\n\n...[Document Truncated for Swarm Memory]..."
-            st.session_state.document_context = text
-            st.success("✅ Securely Loaded into Memory")
-            with st.expander("Preview Extracted Text"):
-                st.write(text[:300] + "...")
+            st.session_state.document_context = text[:15000]
+            st.success("✅ Securely Loaded")
         except Exception as e:
             st.error(f"Error reading PDF: {e}")
             
     st.divider()
-    if st.button("🔒 Log Out"):
+    if st.button("🔒 Log Out", use_container_width=True):
         st.session_state.access_tier = None
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. MAIN DASHBOARD
+# 6. MAIN DASHBOARD UI
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div class="agency-header">
-    <div class="agency-logo">📊</div>
-    <p class="agency-title">{AGENCY_NAME}</p>
-    <p class="agency-sub">Engagement Active · 5 Agents Standing By</p>
+    <div style="font-size: 32px;">⚡</div>
+    <div>
+        <div class="agency-logo">{AGENCY_NAME}</div>
+        <div class="agency-sub">Multi-Agent Swarm Active • Awaiting Instructions</div>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Display Chat History
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        if msg["role"] == "assistant" and msg.get("route"):
-            route_text = " ➔ ".join(msg["route"])
-            st.markdown(f'<div class="route-pill"><span class="route-dot"></span>{route_text}</div>', unsafe_allow_html=True)
-        
-        # Beautiful formatting for the final executive report
-        content = msg["content"]
-        if "EXECUTIVE BOTTOM LINE:" in content:
-            content = content.replace("🎯 EXECUTIVE BOTTOM LINE:", "<div class='exec-section'><div class='exec-label'>🎯 Executive Bottom Line</div>")
-            content = content.replace("🧠 STRATEGIC CONTEXT:", "</div><div class='exec-section'><div class='exec-label'>🧠 Strategic Context</div>")
-            content = content.replace("🚨 RISK FACTORS:", "</div><div class='exec-section'><div class='exec-label'>🚨 Risk Factors</div>")
-            content = content.replace("📊 KEY DATA POINTS:", "</div><div class='exec-section'><div class='exec-label'>📊 Key Data Points</div>")
-            content += "</div>"
-            st.markdown(content, unsafe_allow_html=True)
-        else:
-            st.markdown(content)
+# Render Historical Reports
+for item in st.session_state.history:
+    st.markdown(f"<p style='color: #94a3b8;'><strong>Prompt:</strong> {item['prompt']}</p>", unsafe_allow_html=True)
+    
+    # Try parsing history as JSON
+    parsed = extract_json_from_text(item['output'])
+    if parsed and isinstance(parsed, dict):
+        render_dashboard(parsed)
+    else:
+        # Fallback to standard text if the AI didn't output JSON
+        st.markdown(f"<div class='ds-card'><div class='ds-text'>{item['output']}</div></div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. CHAT INPUT & SWARM EXECUTION
+# 7. CHAT INPUT & THEATER OF WORK
 # ─────────────────────────────────────────────────────────────────────────────
-if prompt := st.chat_input("Initiate intelligence gathering..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+if prompt := st.chat_input("e.g. Give me a deep dive on Ola Electric vs Ather Energy..."):
+    
+    st.markdown(f"<p style='color: #f8fafc; font-size: 18px; margin-top: 20px;'><strong>Query:</strong> {prompt}</p>", unsafe_allow_html=True)
 
-    # Build the full prompt with PDF context
     full_prompt = prompt
     if st.session_state.document_context != "":
-        full_prompt = f"CONFIDENTIAL DOCUMENT PROVIDED BY CLIENT:\n\n{st.session_state.document_context}\n\nCLIENT'S DIRECTIVE REGARDING DOCUMENT: {prompt}"
+         full_prompt = f"DOCUMENT CONTEXT:\n{st.session_state.document_context}\n\nUSER REQUEST: {prompt}"
 
-    with st.chat_message("assistant"):
-        with st.spinner("Swarm is conducting deep research..."):
-            try:
-                result = run_swarm(full_prompt)
-            except Exception as e:
-                result = {"plan": [], "final_answer": f"⚠️ Swarm Critical Error: `{e}`"}
+    # Theater of Work (Streamlit's version of the loading sequence)
+    with st.status("Initializing Swarm Protocol...", expanded=True) as status:
+        st.write("🔄 Engagement Manager analyzing request...")
+        time.sleep(0.5)
+        st.write("🌐 Market Analyst gathering live web/financial data...")
         
-        # Clean up route duplicates
-        clean_route = list(dict.fromkeys(result.get("plan", [])))
-        if clean_route:
-            route_text = " ➔ ".join(clean_route)
-            st.markdown(f'<div class="route-pill"><span class="route-dot"></span>{route_text}</div>', unsafe_allow_html=True)
-
-        final_output = result.get("final_answer", "Swarm failed to generate a response.")
+        try:
+            # THIS IS WHERE IT CALLS YOUR PYTHON SCRIPT
+            result = run_swarm(full_prompt)
+            final_output = result.get("final_answer", "Error: No answer provided.")
+        except Exception as e:
+            final_output = f"⚠️ Swarm Error: {e}"
         
-        # Display beautifully
-        display_output = final_output
-        if "EXECUTIVE BOTTOM LINE:" in display_output:
-            display_output = display_output.replace("🎯 EXECUTIVE BOTTOM LINE:", "<div class='exec-section'><div class='exec-label'>🎯 Executive Bottom Line</div>")
-            display_output = display_output.replace("🧠 STRATEGIC CONTEXT:", "</div><div class='exec-section'><div class='exec-label'>🧠 Strategic Context</div>")
-            display_output = display_output.replace("🚨 RISK FACTORS:", "</div><div class='exec-section'><div class='exec-label'>🚨 Risk Factors</div>")
-            display_output = display_output.replace("📊 KEY DATA POINTS:", "</div><div class='exec-section'><div class='exec-label'>📊 Key Data Points</div>")
-            display_output += "</div>"
-            st.markdown(display_output, unsafe_allow_html=True)
-        else:
-            st.markdown(display_output)
+        st.write("🧠 Strategy Associate drafting memo...")
+        time.sleep(0.5)
+        st.write("🛡️ Risk Director auditing claims...")
+        time.sleep(0.5)
+        st.write("✅ Managing Partner structuring final JSON payload...")
+        status.update(label="Intelligence Compiled Successfully", state="complete", expanded=False)
 
-    st.session_state.messages.append({"role": "assistant", "content": final_output, "route": clean_route})
+    # UI Rendering
+    parsed_json = extract_json_from_text(final_output)
+    
+    if parsed_json and isinstance(parsed_json, dict):
+        # Successfully parsed JSON, render the beautiful dashboard
+        render_dashboard(parsed_json)
+    else:
+        # Fallback if the AI messes up the format
+        st.warning("Data format error: Displaying raw intelligence.")
+        st.markdown(f"<div class='ds-card'><div class='ds-text'>{final_output}</div></div>", unsafe_allow_html=True)
+
+    # Save to history
+    st.session_state.history.append({"prompt": prompt, "output": final_output})
