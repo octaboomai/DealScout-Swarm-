@@ -1,0 +1,138 @@
+"""
+verify_search_setup.py — run this on YOUR machine (laptop, server, cloud VM — anywhere
+with normal internet access), not inside an AI sandbox.
+
+It cannot be verified from inside Claude's tool environment: that environment's network
+is locked to a small allowlist of package registries and dev sites, and explicitly does
+NOT include duckduckgo.com, google.com, serper.dev, or api.search.brave.com. Every one of
+those hosts returns an identical "host_not_allowed" 403 from there. This script is the
+actual proof step -- it makes one real query against every provider you've configured and
+tells you plainly what's working before you wire it into the swarm.
+
+Usage:
+    pip install httpx ddgs --break-system-packages   # or without --break-system-packages
+                                                       # if you're in a venv
+    export SERPER_API_KEY=...      # optional
+    export BRAVE_API_KEY=...       # optional
+    export GOOGLE_CSE_API_KEY=...  # optional, needs GOOGLE_CSE_CX too
+    export GOOGLE_CSE_CX=...       # optional
+    python3 verify_search_setup.py
+"""
+import os
+import sys
+import time
+
+import httpx
+
+try:
+    from ddgs import DDGS
+except ImportError:
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        DDGS = None
+
+TEST_QUERY = "Zerodha vs Groww market share India"
+SEARCH_REGION = os.environ.get("SEARCH_REGION", "in")
+
+
+def check_serper():
+    key = os.environ.get("SERPER_API_KEY")
+    if not key:
+        return "SKIPPED", "SERPER_API_KEY not set"
+    try:
+        r = httpx.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": key, "Content-Type": "application/json"},
+            json={"q": TEST_QUERY, "gl": SEARCH_REGION, "hl": "en", "num": 3},
+            timeout=10,
+        )
+        r.raise_for_status()
+        organic = r.json().get("organic", [])
+        if not organic:
+            return "FAIL", "200 OK but no organic results returned"
+        return "OK", f"{len(organic)} results, first: {organic[0].get('title', '')!r} -> {organic[0].get('link', '')}"
+    except Exception as e:
+        return "FAIL", str(e)
+
+
+def check_brave():
+    key = os.environ.get("BRAVE_API_KEY")
+    if not key:
+        return "SKIPPED", "BRAVE_API_KEY not set"
+    try:
+        r = httpx.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={"X-Subscription-Token": key, "Accept": "application/json"},
+            params={"q": TEST_QUERY, "country": SEARCH_REGION, "count": 3},
+            timeout=10,
+        )
+        r.raise_for_status()
+        results = r.json().get("web", {}).get("results", [])
+        if not results:
+            return "FAIL", "200 OK but no web results returned"
+        return "OK", f"{len(results)} results, first: {results[0].get('title', '')!r} -> {results[0].get('url', '')}"
+    except Exception as e:
+        return "FAIL", str(e)
+
+
+def check_google_cse():
+    key = os.environ.get("GOOGLE_CSE_API_KEY")
+    cx = os.environ.get("GOOGLE_CSE_CX")
+    if not (key and cx):
+        return "SKIPPED", "GOOGLE_CSE_API_KEY / GOOGLE_CSE_CX not set"
+    try:
+        r = httpx.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={"key": key, "cx": cx, "q": TEST_QUERY, "gl": SEARCH_REGION, "num": 3},
+            timeout=10,
+        )
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if not items:
+            return "FAIL", "200 OK but no items returned (check your CSE config covers the whole web)"
+        return "OK", f"{len(items)} results, first: {items[0].get('title', '')!r} -> {items[0].get('link', '')}"
+    except Exception as e:
+        return "FAIL", str(e)
+
+
+def check_ddgs():
+    if DDGS is None:
+        return "FAIL", "neither 'ddgs' nor 'duckduckgo_search' is installed"
+    try:
+        with DDGS(timeout=10) as ddgs:
+            results = list(ddgs.text(TEST_QUERY, region=f"{SEARCH_REGION}-en", safesearch="off", max_results=3))
+        if not results:
+            return "FAIL", "no results (often a rate-limit/anti-bot block, not a real 'no data' answer)"
+        return "OK", f"{len(results)} results, first: {results[0].get('title', '')!r} -> {results[0].get('href', '')}"
+    except Exception as e:
+        return "FAIL", str(e)
+
+
+def main():
+    print(f"Running real connectivity checks against: {TEST_QUERY!r} (region={SEARCH_REGION})\n")
+    checks = [
+        ("serper", check_serper),
+        ("brave", check_brave),
+        ("google_cse", check_google_cse),
+        ("ddgs", check_ddgs),
+    ]
+    results = {}
+    for name, fn in checks:
+        status, detail = fn()
+        results[name] = status
+        print(f"[{status:7s}] {name:12s} {detail}")
+        time.sleep(0.3)  # be polite, don't hammer free tiers back-to-back
+
+    print()
+    working = [n for n, s in results.items() if s == "OK"]
+    if working:
+        print(f"✅ Working provider(s): {', '.join(working)}")
+        print(f"   Set SEARCH_PROVIDER_PRIORITY accordingly, e.g.: SEARCH_PROVIDER_PRIORITY={','.join(working + ['ddgs'])}")
+    else:
+        print("❌ No provider returned real results. Check API keys, internet access, and the FAIL messages above.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
