@@ -1,4 +1,0 @@
-streamlit
-groq
-duckduckgo-search
-PyPDF2
