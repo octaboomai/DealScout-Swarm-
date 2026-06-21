@@ -1,0 +1,12 @@
+# Ignore environment variables (KEEP YOUR API KEYS SAFE)
+.env
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore local data volumes (If using Docker)
+agency_data/
+
+# Ignore the user database (Contains customer info, keep it off public GitHub)
+users.json
