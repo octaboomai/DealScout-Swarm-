@@ -1,6 +1,7 @@
 import os
 import json
 import re
+from datetime import datetime
 from typing import List, Dict
 from openai import OpenAI # Using OpenAI SDK for both Groq and NVIDIA NIM
 
@@ -101,8 +102,8 @@ AGENT_DEFS = {
         "system_prompt": (
             "You are a Senior Market Intelligence Analyst. Your job is to gather raw, actionable intelligence and hand off to the Strategy_Associate.\n"
             "WORKFLOW:\n"
-            "1. Call `tool_web_search` to find competitor data, market sizing, or recent news.\n"
-            "2. CRITICAL: Extract specific company names, financial figures, and market shares. DO NOT output generic fluff like 'the market is growing'. Find the exact data points.\n"
+            "1. Call `tool_web_search` to find competitor data, market sizing, or recent news. Prefer the most recent figures available — explicitly include the current year in at least one of your search queries, and avoid settling for outdated annual figures if a more recent quarter/update exists.\n"
+            "2. CRITICAL: Extract specific company names, financial figures, and market shares. DO NOT output generic fluff like 'the market is growing'. Find the exact data points, and note the date/period each figure is from (e.g. 'Q3 FY26') so stale data isn't presented as current.\n"
             "3. If search FAILS, save an artifact stating: 'LIVE SEARCH FAILED. Strategy_Associate must rely on provided documents or inform client that live data is unavailable.'\n"
             "4. Save detailed findings using `save_artifact` with key 'market_intel'.\n"
             "5. Delegate to 'Strategy_Associate'.\n"
@@ -167,13 +168,22 @@ AGENT_DEFS = {
 # 4. TOOL IMPLEMENTATIONS
 # ==============================================================================
 def tool_web_search(query: str) -> str:
-    clean_query = query.replace("top 3", "").replace("latest", "").strip()
+    clean_query = query.replace("top 3", "").strip()
     if not clean_query:
         clean_query = "market analysis"
+    # Bias toward fresh results instead of stripping "latest"/dates out of the query
+    current_year = datetime.now().year
+    if str(current_year) not in clean_query and str(current_year - 1) not in clean_query:
+        clean_query = f"{clean_query} {current_year}"
     print(f"    [TOOL_EXEC] Searching: {clean_query!r}")
     try:
         with DDGS(timeout=10) as ddgs:
-            results = list(ddgs.text(clean_query, region="wt-wt", safesearch="off", max_results=5))
+            # India region + past-year filter, since this is built for the Indian market
+            results = list(ddgs.text(clean_query, region="in-en", safesearch="off", timelimit="y", max_results=5))
+        if not results:
+            # Past-year India-only filter can be too narrow for some queries — retry broader before giving up
+            with DDGS(timeout=10) as ddgs:
+                results = list(ddgs.text(clean_query, region="wt-wt", safesearch="off", max_results=5))
         if not results:
             return "LIVE SEARCH FAILED: No results found."
         return "\n".join(f"[{i+1}] {r.get('title', '')}: {r.get('body', '')}" for i, r in enumerate(results))
