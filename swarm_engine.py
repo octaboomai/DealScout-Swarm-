@@ -231,7 +231,7 @@ def dispatch_tool_call(state: SwarmState, agent_name: str, agent_def: dict, func
 # ==============================================================================
 # 5. THE AGENTIC EXECUTION LOOP (Self-Healing + Dynamic Model Loading)
 # ==============================================================================
-def execute_agent_loop(state: SwarmState, tier: str = "free", max_steps: int = 15) -> dict:
+def execute_agent_loop(state: SwarmState, tier: str = "free", max_steps: int = 30) -> dict:
     step = 0
     while step < max_steps:
         step += 1
@@ -249,7 +249,8 @@ def execute_agent_loop(state: SwarmState, tier: str = "free", max_steps: int = 1
         try:
             response = client.chat.completions.create(
                 model=model_name, messages=api_messages, tools=agent_tools,
-                tool_choice="auto", max_tokens=2000, temperature=0.3
+                tool_choice="auto", max_tokens=2000, temperature=0.3,
+                parallel_tool_calls=False
             )
         except Exception as e:
             error_str = str(e)
