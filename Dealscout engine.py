@@ -2,27 +2,70 @@ import os
 import json
 import re
 from typing import List, Dict
-from groq import Groq
+from openai import OpenAI # Using OpenAI SDK for both Groq and NVIDIA NIM
 
-# duckduckgo_search was frozen by its maintainer in mid-2025 and renamed to `ddgs`.
-# The old package still installs but no longer gets DuckDuckGo anti-bot fixes, so it
-# silently degrades over time. Prefer `ddgs`; fall back to the legacy name only if
-# that's all that's installed, so this doesn't hard-break on older environments.
+# FIX: Handle the DDGS package rename gracefully
 try:
     from ddgs import DDGS
 except ImportError:
-    from duckduckgo_search import DDGS  # legacy/frozen fallback only
+    from duckduckgo_search import DDGS
 
-print("[*] Initializing DealScout Swarm™ (v13.1 - Agency Edition, patched)...")
-
-if not os.environ.get("GROQ_API_KEY"):
-    raise RuntimeError("FATAL ERROR: GROQ_API_KEY environment variable is not set.")
-
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-MODEL = "llama-3.3-70b-versatile"
+print("[*] Initializing DealScout Swarm™ (v19.0 - Sovereign Pro Stack)...")
 
 # ==============================================================================
-# 1. SHARED WORKSPACE
+# 1. DYNAMIC AI BRAIN ROUTER (Verified Sovereign Models)
+# ==============================================================================
+AGENT_MODELS = {
+    # NOTE (June 2026): llama3-8b-8192 was decommissioned by Groq on 08/30/2025.
+    # llama-3.3-70b-versatile was deprecated 06/17/2026, shutdown 08/16/2026 —
+    # migrating straight to the GPT-OSS models now avoids a second fire drill in August.
+    # See https://console.groq.com/docs/deprecations
+    # Pro-tier strings below are NVIDIA NIM catalog IDs (build.nvidia.com), not OpenRouter.
+    "Engagement_Manager": {
+        "free": "groq/openai/gpt-oss-20b",
+        "pro": "mistralai/mistral-small-4-119b-2603"  # Extremely fast, high IQ, perfect for routing
+    },
+    "Market_Intelligence_Analyst": {
+        "free": "groq/openai/gpt-oss-120b",
+        "pro": "qwen/qwen3-next-80b-a3b-instruct"     # THE KING of web data parsing & extraction
+    },
+    "Strategy_Associate": {
+        "free": "groq/openai/gpt-oss-120b",
+        "pro": "meta/llama-3.1-70b-instruct"          # Heavy hitter for writing executive strategy
+    },
+    "Risk_Director": {
+        "free": "groq/openai/gpt-oss-120b",
+        "pro": "meta/llama-3.1-70b-instruct"          # Heavy hitter for deep logic & catching flaws
+    },
+    "Managing_Partner": {
+        "free": "groq/openai/gpt-oss-20b",
+        "pro": "mistralai/mistral-small-4-119b-2603"  # Lightning fast, flawless formatting
+    }
+}
+
+def get_client_for_model(tier: str, agent_name: str):
+    """Routes to the correct API provider based on user tier and agent role."""
+    model_name = AGENT_MODELS.get(agent_name, {}).get(tier, "groq/openai/gpt-oss-120b")
+    
+    if "groq" in model_name:
+        # FREE TIER -> Use Groq (Cost: $0.00)
+        client = OpenAI(
+            api_key=os.environ.get("GROQ_API_KEY"), 
+            base_url="https://api.groq.com/openai/v1"
+        )
+        # Strip the "groq/" prefix for Groq's API
+        actual_model_name = model_name.replace("groq/", "")
+        return client, actual_model_name
+    else:
+        # PRO TIER -> Use NVIDIA NIM (build.nvidia.com free API; Qwen, Mistral, Llama)
+        client = OpenAI(
+            api_key=os.environ.get("NVIDIA_API_KEY"),
+            base_url="https://integrate.api.nvidia.com/v1"
+        )
+        return client, model_name
+
+# ==============================================================================
+# 2. SHARED WORKSPACE
 # ==============================================================================
 class SwarmState:
     def __init__(self, query: str):
@@ -46,7 +89,7 @@ class SwarmState:
         }
 
 # ==============================================================================
-# 2. AGENT DEFINITIONS (B2B CONSULTING PERSONAS)
+# 3. AGENT DEFINITIONS (B2B CONSULTING PERSONAS)
 # ==============================================================================
 AGENT_DEFS = {
     "Engagement_Manager": {
@@ -101,14 +144,27 @@ AGENT_DEFS = {
         "allowed_transitions": ["Strategy_Associate", "Managing_Partner"]
     },
     "Managing_Partner": {
-        "system_prompt": "You are the Managing Partner. Read the 'strategy_draft' using `read_artifact`. Ensure it is perfectly formatted and polished. Save it as 'final_answer' using `save_artifact`. Then use the `finish_task` tool to end the engagement. DO NOT change the core strategic insights, just ensure executive readability.",
+        "system_prompt": (
+            "You are the Managing Partner. Read the 'strategy_draft' using `read_artifact`.\n"
+            "Convert it into a polished executive report and output it as a SINGLE valid JSON object "
+            "(no markdown code fences, no commentary before or after) with EXACTLY this shape:\n"
+            "{\n"
+            '  "title": "<short report title>",\n'
+            '  "executive_summary": "<2-3 sentence bottom line, plain text>",\n'
+            '  "market_data": [{"label": "<metric name>", "value": "<metric value>", "trend": "<e.g. +12% or -3%, or empty string>"}],\n'
+            '  "risk_matrix": [{"risk": "<risk description>", "severity": "High" or "Medium" or "Low"}]\n'
+            "}\n"
+            "Pull the metrics and risks directly from the strategy_draft — do not invent data that isn't there. "
+            "Save ONLY that JSON string as 'final_answer' using `save_artifact`. Then use the `finish_task` tool to end the engagement. "
+            "DO NOT change the core strategic insights, just restructure them into the JSON shape above."
+        ),
         "tools": ["read_artifact", "save_artifact", "finish_task"],
         "allowed_transitions": []
     }
 }
 
 # ==============================================================================
-# 3. TOOL IMPLEMENTATIONS
+# 4. TOOL IMPLEMENTATIONS
 # ==============================================================================
 def tool_web_search(query: str) -> str:
     clean_query = query.replace("top 3", "").replace("latest", "").strip()
@@ -132,32 +188,10 @@ TOOL_SCHEMAS = [
     {"type": "function", "function": {"name": "finish_task", "description": "End the swarm process.", "parameters": {"type": "object", "properties": {}}}}
 ]
 
-# FIX (tool enforcement gap): every agent used to receive ALL 5 tool schemas regardless
-# of agent_def["tools"]. This filters the schema sent to the model down to exactly what
-# that agent is allowed to use, so e.g. Engagement_Manager can no longer be coaxed into
-# calling tool_web_search and Managing_Partner can't call delegate_to_agent.
 def get_tool_schemas_for_agent(agent_name: str) -> list:
     allowed = set(AGENT_DEFS[agent_name]["tools"])
     return [s for s in TOOL_SCHEMAS if s["function"]["name"] in allowed]
 
-
-# FIX: tool dispatch is now a single shared function used by both the normal tool_calls
-# path AND the self-heal path. This (a) fixes the self-heal branch, which previously
-# could only "heal" tool_web_search and silently failed for every other tool, and
-# (b) adds a server-side permission check so a tool call -- even a hand-parsed,
-# self-healed one that bypassed the schema -- can't execute outside what that agent is
-# allowed to do.
-#
-# FIX (message-ordering bug): delegate_to_agent used to insert a separate `role: user`
-# handoff message into state.messages immediately after the assistant's tool_calls
-# message but BEFORE the matching `role: tool` reply was appended. Groq/OpenAI-style
-# APIs require every tool_call to be followed immediately by its own tool-role reply,
-# with no other role interleaved -- so any turn with multiple tool calls (very common;
-# e.g. tool_web_search + save_artifact + delegate_to_agent all in one turn) produced an
-# invalid message sequence that would 400 on the *next* API call. The handoff note is
-# now folded into the tool's own observation string instead of a separate message, so
-# the sequence is always: assistant(tool_calls) -> tool, tool, tool... with nothing
-# else in between.
 def dispatch_tool_call(state: SwarmState, agent_name: str, agent_def: dict, func_name: str, func_args: dict):
     """Returns (observation: str, finished: bool)."""
     if func_name not in agent_def["tools"]:
@@ -174,6 +208,7 @@ def dispatch_tool_call(state: SwarmState, agent_name: str, agent_def: dict, func
                      f"Delegate to: {agent_def['allowed_transitions']}."), False
         state.current_agent = next_agent
         handoff_note = func_args.get("message", "")
+        # FIX: Fold handoff note into observation to prevent message-ordering 400 errors
         return f"Control handed over to {next_agent}. Handoff note from {agent_name}: {handoff_note}", False
 
     elif func_name == "save_artifact":
@@ -193,35 +228,32 @@ def dispatch_tool_call(state: SwarmState, agent_name: str, agent_def: dict, func
 
     return f"Error: Tool {func_name} not found.", False
 
-
 # ==============================================================================
-# 4. THE AGENTIC EXECUTION LOOP (With Self-Healing)
+# 5. THE AGENTIC EXECUTION LOOP (Self-Healing + Dynamic Model Loading)
 # ==============================================================================
-def execute_agent_loop(state: SwarmState, max_steps: int = 15) -> dict:
+def execute_agent_loop(state: SwarmState, tier: str = "free", max_steps: int = 15) -> dict:
     step = 0
     while step < max_steps:
         step += 1
         agent_name = state.current_agent
         agent_def = AGENT_DEFS[agent_name]
-        print(f"\n[STEP {step}] Executing Agent: {agent_name}")
+        
+        # DYNAMIC MODEL LOADING: Get the right AI brain for this specific agent and tier
+        client, model_name = get_client_for_model(tier, agent_name)
+        print(f"\n[STEP {step}] Executing Agent: {agent_name} | Model: {model_name} | Tier: {tier}")
+        
         state.plan.append(agent_name)
-
         api_messages = [{"role": "system", "content": agent_def["system_prompt"]}] + state.messages
         agent_tools = get_tool_schemas_for_agent(agent_name)
 
         try:
             response = client.chat.completions.create(
-                model=MODEL, messages=api_messages, tools=agent_tools,
+                model=model_name, messages=api_messages, tools=agent_tools,
                 tool_choice="auto", max_tokens=2000, temperature=0.3
             )
         except Exception as e:
             error_str = str(e)
-            # FIX: original regex was `<function=(\w+)=({.*?})</function>` which requires
-            # an '=' directly before the JSON blob. The actual shape Groq returns in
-            # failed_generation is `<function=NAME>{...}</function>` (a '>' , not '=').
-            # The old pattern therefore could NEVER match, meaning self-heal was dead
-            # code and the swarm just crashed the whole engagement on any malformed
-            # function call. Confirmed with a regex test against a realistic error string.
+            # Self-Heal: Catch malformed XML function calls
             if "failed_generation" in error_str and "<function=" in error_str:
                 print("    [SELF-HEAL] Caught malformed function call. Parsing manually...")
                 match = re.search(r'<function=(\w+)>(\{.*?\})</function>', error_str)
@@ -244,6 +276,12 @@ def execute_agent_loop(state: SwarmState, max_steps: int = 15) -> dict:
                     if finished:
                         return state.to_dict()
                     continue
+            
+            # Catch Rate Limits
+            elif "429" in error_str or "rate_limit" in error_str.lower():
+                state.add_artifact("final_answer", "⚠️ **Swarm is at Capacity:** Servers experiencing high traffic. Please wait 60 seconds or upgrade to Pro for priority access.")
+                return state.to_dict()
+                
             state.add_artifact("final_answer", f"⚠️ Swarm API Error: {e}")
             return state.to_dict()
 
@@ -254,9 +292,7 @@ def execute_agent_loop(state: SwarmState, max_steps: int = 15) -> dict:
                 try:
                     func_args = json.loads(tool_call.function.arguments)
                 except json.JSONDecodeError:
-                    # FIX: malformed JSON arguments used to crash the whole process.
-                    # Now we feed the error back to the model as a tool result so it
-                    # can retry with valid arguments.
+                    # FIX: Feed JSON parse errors back to the model
                     state.messages.append({
                         "role": "tool", "name": tool_call.function.name,
                         "content": f"ERROR: Could not parse arguments as JSON: {tool_call.function.arguments!r}",
@@ -268,9 +304,6 @@ def execute_agent_loop(state: SwarmState, max_steps: int = 15) -> dict:
                 print(f"    [ACTION] {func_name}({func_args})")
                 observation, finished = dispatch_tool_call(state, agent_name, agent_def, func_name, func_args)
 
-                # Every tool_call gets exactly one tool-role reply, appended right away,
-                # with nothing else interleaved -- this is what keeps the message
-                # sequence valid for the next API call.
                 state.messages.append({"role": "tool", "name": func_name, "content": str(observation), "tool_call_id": tool_call.id})
 
                 if finished:
@@ -280,9 +313,6 @@ def execute_agent_loop(state: SwarmState, max_steps: int = 15) -> dict:
             state.messages.append({"role": "assistant", "content": choice.message.content})
             state.messages.append({"role": "user", "content": "You must use a tool to proceed. Delegate, save, or finish."})
         else:
-            # FIX: previously this just `break`-ed and let the generic "exceeded maximum
-            # steps" message overwrite the real reason. Now we record what actually
-            # happened (e.g. finish_reason == "length" or "content_filter").
             state.add_artifact("final_answer", f"⚠️ Swarm stopped unexpectedly (finish_reason='{choice.finish_reason}').")
             break
 
@@ -291,11 +321,11 @@ def execute_agent_loop(state: SwarmState, max_steps: int = 15) -> dict:
     return state.to_dict()
 
 # ==============================================================================
-# 5. ENTRY POINT
+# 6. ENTRY POINT
 # ==============================================================================
-def run_swarm(user_prompt: str) -> dict:
-    print(f"\n[SWARM v13.1] Query: {user_prompt[:60]}...")
+def run_swarm(user_prompt: str, tier: str = "free") -> dict:
+    print(f"\n[SWARM v19.0] Query: {user_prompt[:60]}... (Tier: {tier})")
     state = SwarmState(query=user_prompt)
     state.current_agent = "Engagement_Manager"
     state.messages.append({"role": "user", "content": f"Client Request: {user_prompt}\n\nPlease delegate this to the appropriate consultant."})
-    return execute_agent_loop(state)
+    return execute_agent_loop(state, tier=tier)
