@@ -115,11 +115,13 @@ def render_dashboard(data: dict):
     # Market Data Card
     html += '<div class="ds-card" style="flex: 1; min-width: 300px;"><h3 class="ds-card-title"><span class="ds-icon">📊</span> Key Data Points</h3>'
     metrics = data.get('market_data', [])
+    if not isinstance(metrics, list):
+        metrics = []
     for m in metrics:
         if isinstance(m, dict):
-            label = m.get('label', 'Metric')
-            val = m.get('value', 'N/A')
-            trend = m.get('trend', '')
+            label = str(m.get('label', 'Metric'))
+            val = str(m.get('value', 'N/A'))
+            trend = str(m.get('trend') or '')
             trend_class = "ds-trend-up" if "+" in trend else "ds-trend-down" if "-" in trend else "ds-trend-flat"
             
             html += f"""
@@ -135,10 +137,12 @@ def render_dashboard(data: dict):
     # Risk Matrix Card
     html += '<div class="ds-card" style="flex: 1; min-width: 300px;"><h3 class="ds-card-title"><span class="ds-icon">🚨</span> Risk Matrix</h3>'
     risks = data.get('risk_matrix', [])
+    if not isinstance(risks, list):
+        risks = []
     for r in risks:
         if isinstance(r, dict):
-            risk_text = r.get('risk', 'Unknown Risk')
-            sev = r.get('severity', 'Medium')
+            risk_text = str(r.get('risk', 'Unknown Risk'))
+            sev = str(r.get('severity') or 'Medium')
             badge_class = "ds-badge-high" if sev.lower() == "high" else "ds-badge-low" if sev.lower() == "low" else "ds-badge-medium"
             
             html += f"""
@@ -274,7 +278,7 @@ if prompt := st.chat_input("e.g. Give me a deep dive on Ola Electric vs Ather En
         
         try:
             # THIS IS WHERE IT CALLS YOUR PYTHON SCRIPT
-            result = run_swarm(full_prompt)
+            result = run_swarm(full_prompt, tier=st.session_state.access_tier)
             final_output = result.get("final_answer", "Error: No answer provided.")
         except Exception as e:
             final_output = f"⚠️ Swarm Error: {e}"
