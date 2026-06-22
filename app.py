@@ -14,7 +14,7 @@ from swarm_engine import run_swarm
 # 1. AGENCY CONFIGURATION (WhatsApp + UPI Method)
 # ─────────────────────────────────────────────────────────────────────────────
 AGENCY_NAME = "DealScout Intelligence™"
-WHATSAPP_NUMBER = "919876543210" 
+WHATSAPP_NUMBER = "*******" 
 UPGRADE_MESSAGE = "Hi! I want to upgrade to DealScout Pro Unlimited Access. Please share the payment details."
 WHATSAPP_LINK = f"https://wa.me/{WHATSAPP_NUMBER}?text={UPGRADE_MESSAGE.replace(' ', '%20')}"
 
@@ -157,6 +157,10 @@ def render_dashboard(data: dict):
 
     html += '</div></div>' # Close flex container and wrapper
     
+    # Strip newlines + their leading whitespace: a blank line followed by 4+ spaces of
+    # indentation makes Streamlit's markdown parser treat the rest as a literal code block
+    # instead of HTML. HTML rendering doesn't care about these newlines anyway.
+    html = re.sub(r'\n\s*', '', html)
     st.markdown(html, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
