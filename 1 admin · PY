@@ -1,0 +1,82 @@
+import os
+import sys
+import streamlit as st
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+import auth
+
+st.set_page_config(page_title="DealScout Admin", layout="centered")
+st.title("🔐 DealScout Admin")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Password gate — separate from customer accounts entirely. Set ADMIN_PASSWORD
+# in Streamlit secrets. This page does the work Razorpay-webhook automation
+# will eventually do, until that's built (Phase 2).
+# ─────────────────────────────────────────────────────────────────────────────
+if "admin_ok" not in st.session_state:
+    st.session_state.admin_ok = False
+
+if not st.session_state.admin_ok:
+    pw = st.text_input("Admin password", type="password")
+    if st.button("Unlock"):
+        if pw and pw == os.environ.get("ADMIN_PASSWORD"):
+            st.session_state.admin_ok = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    st.stop()
+
+st.success("Unlocked.")
+st.caption("Use this after you've personally confirmed a UPI/WhatsApp payment from a customer.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Issue / top up Pro tokens — fully flexible amount, no fixed bundle sizes.
+# Works the same for a first purchase or a top-up: tokens add to whatever
+# balance the account already has.
+# ─────────────────────────────────────────────────────────────────────────────
+st.header("💎 Issue / Top Up Pro Tokens")
+
+with st.form("issue_code_form"):
+    issue_email = st.text_input("Customer's account email (must have already signed up / logged in once)")
+    token_amount = st.number_input("Tokens to add", min_value=1, value=500_000, step=10_000)
+    price_note = st.text_input("Price charged, for your own reference (optional, not stored)", placeholder="e.g. ₹799")
+    submitted = st.form_submit_button("Generate & Email Code", use_container_width=True)
+
+if submitted:
+    if not issue_email:
+        st.error("Enter the customer's email.")
+    else:
+        result = auth.issue_pro_code(issue_email, int(token_amount))
+        if result is None:
+            st.error("No account found for that email — they need to sign up / log in to the main app at least once first.")
+        else:
+            sent = auth.send_pro_code_email(issue_email, result["code"], int(token_amount))
+            note = f" (charged {price_note})" if price_note else ""
+            st.success(f"Code generated: **{result['code']}** — adds {token_amount:,} tokens{note}")
+            if sent:
+                st.info(f"Emailed to {issue_email}.")
+            else:
+                st.warning("Email send failed (check RESEND_API_KEY / verified domain) — share this code with them manually for now.")
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grant a bonus reset — for free-tier users who paid ₹50 to skip the 4-hour
+# wait instead of buying into Pro outright.
+# ─────────────────────────────────────────────────────────────────────────────
+st.header("⏱️ Grant Bonus Reset (Free Tier)")
+st.caption("Immediately resets a free user's 4-hour window, giving them a fresh 3 prompts / 2 uploads right now.")
+
+with st.form("bonus_reset_form"):
+    bonus_email = st.text_input("Customer's account email", key="bonus_email")
+    bonus_submitted = st.form_submit_button("Reset Their Window Now", use_container_width=True)
+
+if bonus_submitted:
+    if not bonus_email:
+        st.error("Enter the customer's email.")
+    else:
+        ok = auth.grant_bonus_reset(bonus_email)
+        if ok:
+            st.success(f"Reset {bonus_email}'s window — they have a fresh 3 prompts / 2 uploads now.")
+        else:
+            st.error("No account found for that email.")
