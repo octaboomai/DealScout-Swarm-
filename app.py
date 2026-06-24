@@ -6,20 +6,18 @@ import json
 import re
 import time
 
-# Ensure swarm_engine is in path
+# Ensure swarm_engine and auth are in path
 sys.path.append(os.path.dirname(__file__))
 from swarm_engine import run_swarm
+import auth
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. AGENCY CONFIGURATION (WhatsApp + UPI Method)
 # ─────────────────────────────────────────────────────────────────────────────
 AGENCY_NAME = "DealScout Intelligence™"
-WHATSAPP_NUMBER = "*******" 
+WHATSAPP_NUMBER = "919876543210" 
 UPGRADE_MESSAGE = "Hi! I want to upgrade to DealScout Pro Unlimited Access. Please share the payment details."
 WHATSAPP_LINK = f"https://wa.me/{WHATSAPP_NUMBER}?text={UPGRADE_MESSAGE.replace(' ', '%20')}"
-
-FREE_TRIAL_CODE = "FREETRIAL"
-PRO_UNLOCK_CODE = "DEALSCOUT_PRO_2024"
 
 st.set_page_config(page_title=AGENCY_NAME, layout="centered", initial_sidebar_state="expanded")
 
@@ -164,47 +162,52 @@ def render_dashboard(data: dict):
     st.markdown(html, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. AGENCY ACCESS GATE 
+# 4. AUTHENTICATION GATE (Supabase: real per-user accounts)
 # ─────────────────────────────────────────────────────────────────────────────
-if "access_tier" not in st.session_state:
-    st.session_state.access_tier = None 
+if "user" not in st.session_state:
+    st.session_state.user = None
 
-if st.session_state.access_tier is None:
+if st.session_state.user is None:
     st.markdown(f"""
-    <div style="text-align: center; margin-top: 10vh; margin-bottom: 40px;">
+    <div style="text-align: center; margin-top: 8vh; margin-bottom: 30px;">
         <h1 style="font-size: 3rem; margin-bottom: 0;">DealScout <span style="color: #34d399;">Pro</span></h1>
         <p style="color: #94a3b8; font-size: 1.1rem;">Autonomous B2B Intelligence & Risk Mitigation Platform</p>
     </div>
     """, unsafe_allow_html=True)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("<div class='ds-card'>", unsafe_allow_html=True)
-        st.markdown("### 🆓 Trial Access")
-        st.markdown("Use your invite code to run a limited test.")
-        free_code = st.text_input("Enter Free Trial Code:", key="free_code")
-        if st.button("Unlock Free Trial", use_container_width=True):
-            if free_code == FREE_TRIAL_CODE:
-                st.session_state.access_tier = "free"
+
+    tab_login, tab_signup = st.tabs(["🔑 Log In", "🆕 Sign Up"])
+
+    with tab_login:
+        login_email = st.text_input("Email", key="login_email")
+        login_pw = st.text_input("Password", type="password", key="login_pw")
+        if st.button("Log In", use_container_width=True, key="login_btn"):
+            try:
+                resp = auth.sign_in(login_email, login_pw)
+                st.session_state.user = {"id": resp.user.id, "email": resp.user.email}
+                st.session_state.access_token = resp.session.access_token
+                st.session_state.refresh_token = resp.session.refresh_token
                 st.rerun()
-            else:
-                st.error("Invalid Code.")
-        st.markdown("</div>", unsafe_allow_html=True)
-                
-    with col2:
-        st.markdown("<div class='ds-card'>", unsafe_allow_html=True)
-        st.markdown("### 💎 Pro Access")
-        st.markdown("Unlimited reports. Instant UPI Setup.")
-        st.markdown(f'<a href="{WHATSAPP_LINK}" target="_blank" class="whatsapp-btn">💬 Get Pro Code via WhatsApp</a>', unsafe_allow_html=True)
-        pro_code = st.text_input("Enter Pro Code (sent via WhatsApp):", key="pro_code")
-        if st.button("Unlock Pro", use_container_width=True):
-            if pro_code == PRO_UNLOCK_CODE:
-                st.session_state.access_tier = "pro"
-                st.rerun()
-            else:
-                st.error("Invalid Pro Code.")
-        st.markdown("</div>", unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Login failed: {e}")
+
+    with tab_signup:
+        signup_email = st.text_input("Email", key="signup_email")
+        signup_pw = st.text_input("Password (min 6 characters)", type="password", key="signup_pw")
+        if st.button("Create Account", use_container_width=True, key="signup_btn"):
+            try:
+                auth.sign_up(signup_email, signup_pw)
+                st.success("Account created! Check your email to confirm it, then log in on the other tab.")
+            except Exception as e:
+                st.error(f"Sign up failed: {e}")
+
     st.stop()
+
+# Logged in — refresh subscription + usage from Supabase every run, so tokens
+# running out or a code being redeemed elsewhere is always reflected.
+user = st.session_state.user
+subscription = auth.get_or_create_subscription(user["id"], user["email"])
+st.session_state.access_tier = auth.get_active_tier(subscription)
+st.session_state.usage = auth.get_usage(user["id"])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. SECURE DEAL ROOM (Sidebar)
@@ -215,27 +218,72 @@ if "history" not in st.session_state:
     st.session_state.history = []
 
 with st.sidebar:
-    st.markdown(f"### 👤 Tier: {st.session_state.access_tier.upper()}")
-    if st.session_state.access_tier == 'free':
-        st.markdown(f'<a href="{WHATSAPP_LINK}" target="_blank" class="whatsapp-btn">⚡ Upgrade to Pro</a>', unsafe_allow_html=True)
-    
+    st.markdown(f"### 👤 {user['email']}")
+    st.markdown(f"**Tier:** {st.session_state.access_tier.upper()}")
+
+    if st.session_state.access_tier == "pro":
+        balance = subscription.get("token_balance") or 0
+        st.caption(f"Pro access — {balance:,} tokens remaining")
+        with st.expander("🎁 Top Up Tokens"):
+            redeem_code = st.text_input("Code emailed to you after payment:", key="redeem_code")
+            if st.button("Add Tokens", use_container_width=True, key="redeem_btn"):
+                ok, msg = auth.redeem_pro_code(user["id"], redeem_code)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+    else:
+        usage = st.session_state.usage
+        prompts_left = max(auth.FREE_PROMPT_LIMIT - usage.get("prompts_in_window", 0), 0)
+        pdfs_left = max(auth.FREE_PDF_LIMIT - usage.get("pdf_uploads_in_window", 0), 0)
+        if prompts_left == 0:
+            mins = auth.minutes_until_reset(usage)
+            st.caption(f"Free tier — 0 prompts left, resets in {mins} min · {pdfs_left} PDF upload(s) left this window")
+        else:
+            st.caption(f"Free tier — {prompts_left} prompt(s) and {pdfs_left} PDF upload(s) left (resets every {auth.RATE_LIMIT_WINDOW_HOURS}h)")
+        st.markdown(f'<a href="{WHATSAPP_LINK}" target="_blank" class="whatsapp-btn">⚡ Buy Pro Tokens</a>', unsafe_allow_html=True)
+
+        with st.expander("🎁 Redeem Pro Code"):
+            redeem_code = st.text_input("Code emailed to you after payment:", key="redeem_code")
+            if st.button("Activate Pro", use_container_width=True, key="redeem_btn"):
+                ok, msg = auth.redeem_pro_code(user["id"], redeem_code)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
     st.divider()
     st.markdown("### 📂 Deal Room Vault")
     st.markdown("<p style='color: #94a3b8; font-size: 13px;'>Upload PDF for RAG Analysis.</p>", unsafe_allow_html=True)
-    
-    uploaded_file = st.file_uploader("", type="pdf")
-    if uploaded_file is not None:
-        try:
-            pdf_reader = PyPDF2.PdfReader(uploaded_file)
-            text = "".join([page.extract_text() + "\n" for page in pdf_reader.pages if page.extract_text()])
-            st.session_state.document_context = text[:15000]
-            st.success("✅ Securely Loaded")
-        except Exception as e:
-            st.error(f"Error reading PDF: {e}")
-            
+
+    pdf_blocked = st.session_state.access_tier == "free" and not auth.can_upload_pdf_free(st.session_state.usage)
+    if pdf_blocked:
+        mins = auth.minutes_until_reset(st.session_state.usage)
+        st.warning(f"Free PDF upload limit reached for this window. Resets in {mins} min, or pay via WhatsApp to reset now, or upgrade to Pro.")
+        st.markdown(f'<a href="{WHATSAPP_LINK}" target="_blank" class="whatsapp-btn">💬 Reset Now (₹50)</a>', unsafe_allow_html=True)
+    else:
+        uploaded_file = st.file_uploader("", type="pdf")
+        # Guard against re-counting the same upload on every script rerun
+        if uploaded_file is not None and uploaded_file.name != st.session_state.get("_last_pdf_name"):
+            try:
+                pdf_reader = PyPDF2.PdfReader(uploaded_file)
+                text = "".join([page.extract_text() + "\n" for page in pdf_reader.pages if page.extract_text()])
+                st.session_state.document_context = text[:15000]
+                st.session_state._last_pdf_name = uploaded_file.name
+                if st.session_state.access_tier == "free":
+                    auth.record_pdf_used(user["id"])
+                st.success("✅ Securely Loaded")
+            except Exception as e:
+                st.error(f"Error reading PDF: {e}")
+
     st.divider()
     if st.button("🔒 Log Out", use_container_width=True):
-        st.session_state.access_tier = None
+        auth.sign_out(st.session_state.get("access_token", ""), st.session_state.get("refresh_token", ""))
+        for key in ["user", "access_token", "refresh_token", "access_tier", "usage",
+                    "document_context", "history", "_last_pdf_name"]:
+            st.session_state.pop(key, None)
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,7 +315,13 @@ for item in st.session_state.history:
 # 7. CHAT INPUT & THEATER OF WORK
 # ─────────────────────────────────────────────────────────────────────────────
 if prompt := st.chat_input("e.g. Give me a deep dive on Ola Electric vs Ather Energy..."):
-    
+
+    if st.session_state.access_tier == "free" and not auth.can_generate_prompt(st.session_state.usage):
+        mins = auth.minutes_until_reset(st.session_state.usage)
+        st.warning(f"Free prompt limit reached for this window. Resets in {mins} min, or pay via WhatsApp to reset now, or upgrade to Pro.")
+        st.markdown(f'<a href="{WHATSAPP_LINK}" target="_blank" class="whatsapp-btn">💬 Reset Now (₹50)</a>', unsafe_allow_html=True)
+        st.stop()
+
     st.markdown(f"<p style='color: #f8fafc; font-size: 18px; margin-top: 20px;'><strong>Query:</strong> {prompt}</p>", unsafe_allow_html=True)
 
     full_prompt = prompt
@@ -284,6 +338,11 @@ if prompt := st.chat_input("e.g. Give me a deep dive on Ola Electric vs Ather En
             # THIS IS WHERE IT CALLS YOUR PYTHON SCRIPT
             result = run_swarm(full_prompt, tier=st.session_state.access_tier)
             final_output = result.get("final_answer", "Error: No answer provided.")
+            tokens_used = result.get("tokens_used", 0)
+            if st.session_state.access_tier == "free":
+                auth.record_prompt_used(user["id"])
+            else:
+                auth.spend_tokens(user["id"], tokens_used)
         except Exception as e:
             final_output = f"⚠️ Swarm Error: {e}"
         
