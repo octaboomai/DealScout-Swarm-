@@ -75,6 +75,7 @@ class SwarmState:
         self.artifacts = {}
         self.messages = []
         self.current_agent = None
+        self.total_tokens = 0
 
     def add_artifact(self, key: str, value: str):
         self.artifacts[key] = value
@@ -86,7 +87,8 @@ class SwarmState:
         return {
             "plan": self.plan,
             "final_answer": self.artifacts.get("final_answer", "Error: No final answer generated."),
-            "history": self.messages
+            "history": self.messages,
+            "tokens_used": self.total_tokens
         }
 
 # ==============================================================================
@@ -297,6 +299,8 @@ def execute_agent_loop(state: SwarmState, tier: str = "free", max_steps: int = 3
             return state.to_dict()
 
         choice = response.choices[0]
+        if getattr(response, "usage", None):
+            state.total_tokens += getattr(response.usage, "total_tokens", 0) or 0
         if choice.finish_reason == "tool_calls":
             state.messages.append(choice.message)
             for tool_call in choice.message.tool_calls:
